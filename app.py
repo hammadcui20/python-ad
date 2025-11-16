@@ -8,6 +8,7 @@ from utils.ffmpeg_tools import probe_media, extract_audio, ensure_ffmpeg_install
 from detection.video_detect import detect_video_ad_candidates
 from detection.audio_detect import detect_audio_ads
 from detection.ad_match_v2 import AdMatcher, AdMatchConfig
+from detection.audio_match import find_audio_occurrences
 
 from config import AppConfig
 
@@ -358,6 +359,89 @@ def match_ad():
 
         return jsonify(result)
     
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+@app.route("/match_audio", methods=["POST"])
+def match_audio():
+    """
+    POST multipart/form-data:
+      - sample_audio: audio file (wav/mp3) containing the advertisement sample
+      - target: audio or video file to search in
+      - optional form parameters: sr, hop_ms, n_mels, match_threshold, min_match_duration_seconds
+    """
+    if "sample_audio" not in request.files:
+        return jsonify({"error": "No sample_audio field provided"}), 400
+    if "target" not in request.files:
+        return jsonify({"error": "No target field provided"}), 400
+
+    sample_file = request.files["sample_audio"]
+    target_file = request.files["target"]
+
+    if sample_file.filename == "":
+        return jsonify({"error": "Empty sample_audio filename"}), 400
+    if target_file.filename == "":
+        return jsonify({"error": "Empty target filename"}), 400
+
+    sample_filename = secure_filename(sample_file.filename)
+    target_filename = secure_filename(target_file.filename)
+
+    os.makedirs(app.config["UPLOAD_DIR"], exist_ok=True)
+    tmp_dir = tempfile.mkdtemp(prefix="match_audio_", dir=app.config["UPLOAD_DIR"])
+    sample_path = os.path.join(tmp_dir, f"sample_{sample_filename}")
+    target_path = os.path.join(tmp_dir, f"target_{target_filename}")
+
+    sample_file.save(sample_path)
+    target_file.save(target_path)
+
+    try:
+        ensure_ffmpeg_installed()
+        # If target is video, extract audio
+        media_info = probe_media(target_path)
+        has_audio = False
+        if media_info:
+            has_audio = has_audio_stream(media_info)
+        if media_info and any(s.get("codec_type") == "video" for s in media_info.get("streams", [])):
+            if not has_audio:
+                return jsonify({"error": "Target video has no audio stream"}), 400
+            audio_target_path = os.path.join(tmp_dir, "target_audio.wav")
+            extract_audio(target_path, audio_target_path, sample_rate=22050, mono=True)
+        else:
+            # target is an audio file already
+            audio_target_path = target_path
+
+        # Read optional params
+        sr = int(request.form.get("sr", 22050))
+        hop_ms = int(request.form.get("hop_ms", 50))
+        n_mels = int(request.form.get("n_mels", 64))
+        match_threshold = float(request.form.get("match_threshold", 0.72))
+        min_match_duration_seconds = float(request.form.get("min_match_duration_seconds", 1.0))
+
+        occurrences = find_audio_occurrences(
+            sample_audio_path=sample_path,
+            target_audio_path=audio_target_path,
+            sr=sr,
+            hop_ms=hop_ms,
+            n_mels=n_mels,
+            match_threshold=match_threshold,
+            min_match_duration_seconds=min_match_duration_seconds,
+        )
+
+        # Summarize
+        total_occurrences = len(occurrences)
+        total_duration_ms = sum(o["duration_ms"] for o in occurrences)
+        avg_confidence = sum(o["confidence"] for o in occurrences) / total_occurrences if total_occurrences > 0 else 0.0
+
+        result = {
+            "sample_audio": {"filename": sample_filename},
+            "target": {"filename": target_filename},
+            "matches": {"total_occurrences": total_occurrences, "total_duration_ms": total_duration_ms, "average_confidence": round(avg_confidence, 3)},
+            "occurrences": occurrences,
+        }
+
+        return jsonify(result)
     except Exception as e:
         import traceback
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
